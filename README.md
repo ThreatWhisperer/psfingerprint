@@ -44,7 +44,7 @@ That's what you need at the start of triage:
 Requires **Python 3.8+**. No packages to install.
 
 ```bash
-git clone https://github.com/<you>/psfingerprint.git
+git clone https://github.com/ThreatWhisperer/psfingerprint.git
 cd psfingerprint
 
 # Always analyse samples saved with a non-executable extension
