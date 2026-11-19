@@ -221,3 +221,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+samples/
+*.ps1.txt
+*.bin
+report*.json
