@@ -7,6 +7,9 @@ Reads a script as text (never executes it), reports:
   * which known OBFUSCATOR / builder profiles best match
   * every likely EXECUTION SINK (line numbers) so you know what to defang
   * blobs / decoding hints (base64, byte arrays, Base85, XOR keys, compression)
+  * DECODED content: Base64, -enc, hex, decimal/byte arrays, [char] chains and
+    Base85, peeled recursively through UTF-16, GZip/Deflate and XOR (including
+    repeating-key recovery), plus IoCs, and an optional cleaned copy
 
 Usage:
   python -I psfingerprint.py sample.txt            full report
@@ -224,9 +227,361 @@ def scan(text: str):
     return res
 
 # --------------------------------------------------------------------------
+# Static decoding engine (never executes input)
+# --------------------------------------------------------------------------
+import binascii, hashlib, os, zlib, gzip as _gzip
+
+MAX_DEPTH = 5
+PS_WORDS = re.compile(r"(?i)\b(?:iex|invoke-|new-object|function|param|\$env:|frombase64|downloadstring|start-process|write-host|\[convert\]|\[system\.|http)")
+B85_PS = "".join(chr(c) for c in range(33, 123) if c not in (34, 36, 39, 92, 96))  # seen in Donut injectors
+B85_ALPHABETS = [
+    ("Base85 (RFC1924/Python)", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~"),
+    ("Base85 (ASCII85)", "".join(chr(c) for c in range(33, 118))),
+    ("Base85 (custom: printable minus quotes/$/`)", B85_PS),
+]
+
+def _bytes_entropy(b: bytes) -> float:
+    if not b: return 0.0
+    c = collections.Counter(b); n = len(b)
+    return -sum(v / n * math.log2(v / n) for v in c.values())
+
+def _printable_ratio(b: bytes) -> float:
+    if not b: return 0.0
+    return sum(1 for x in b if x in (9, 10, 13) or 32 <= x < 127) / len(b)
+
+def _utf16_ratio(b: bytes) -> float:
+    if len(b) < 4: return 0.0
+    hi = b[1::2]
+    return sum(1 for x in hi if x == 0) / len(hi)
+
+def _b64(s: str):
+    s = re.sub(r"\s+", "", s)
+    if len(s) < 16 or len(s) % 4 == 1: return None
+    s += "=" * (-len(s) % 4)
+    try: return base64.b64decode(s, validate=True)
+    except (binascii.Error, ValueError): return None
+
+def _b85_custom(s: str, alpha: str):
+    idx = {c: i for i, c in enumerate(alpha)}
+    s = re.sub(r"\s+", "", s)
+    if any(c not in idx for c in s): return None
+    out = bytearray(); full, rem = divmod(len(s), 5)
+    try:
+        for i in range(full):
+            v = 0
+            for c in s[i*5:i*5+5]: v = v * 85 + idx[c]
+            out += v.to_bytes(4, "big")
+        if rem:
+            if rem == 1: return None
+            v = 0
+            for c in s[full*5:]: v = v * 85 + idx[c]
+            for _ in range(5 - rem): v = v * 85 + 84
+            out += v.to_bytes(4, "big")[:rem - 1]
+    except OverflowError:
+        return None
+    return bytes(out)
+
+def _whole(text, rx):
+    return re.fullmatch(rx, text.strip()) is not None
+
+def peel(data: bytes, chain=None, depth=0):
+    """Recursively decode a byte blob. Returns (chain_list, final_bytes, final_kind, final_text_or_None)."""
+    chain = list(chain or [])
+    if depth > MAX_DEPTH or not data:
+        return chain, data, "empty" if not data else "max-depth", None
+    # containers / formats
+    if data[:2] == b"\x1f\x8b":
+        try: return peel(_gzip.decompress(data), chain + ["GZip"], depth + 1)
+        except Exception: pass
+    if data[:2] == b"MZ":
+        return chain, data, "PE executable (MZ)", None
+    if data[:1] == b"\xe8" and len(data) > 1024 and _bytes_entropy(data[5:4096]) > 7.5:
+        return chain, data, "Donut shellcode (E8 + encrypted instance)", None
+    if data[:4] == b"\x7fELF":
+        return chain, data, "ELF executable", None
+    if data[:2] == b"PK":
+        return chain, data, "ZIP archive", None
+    # text?
+    text = None
+    if _utf16_ratio(data) > 0.85 and len(data) % 2 == 0:
+        try: text = data.decode("utf-16le"); chain = chain + ["UTF-16LE text"]
+        except UnicodeDecodeError: text = None
+    if text is None and _printable_ratio(data) > 0.95:
+        text = data.decode("utf-8", errors="replace"); chain = chain + ["text"]
+    if text is not None:
+        t = text.strip()
+        if len(t) >= 16 and _whole(t, r"[A-Za-z0-9+/\s]+={0,2}"):
+            b = _b64(t)
+            if b: return peel(b, chain + ["Base64"], depth + 1)
+        if len(t) >= 16 and _whole(t, r"(?:[0-9A-Fa-f]{2}\s*)+"):
+            try: return peel(bytes.fromhex(re.sub(r"\s+", "", t)), chain + ["hex"], depth + 1)
+            except ValueError: pass
+        if _whole(t, r"(?:\d{1,3}\s*,\s*){7,}\d{1,3}"):
+            nums = [int(x) for x in re.findall(r"\d+", t)]
+            if all(n < 256 for n in nums): return peel(bytes(nums), chain + ["decimal bytes"], depth + 1)
+        return chain, data, "text", text
+    # raw deflate (common: IO.Compression.DeflateStream)
+    if _bytes_entropy(data[:4096]) > 6.5:
+        for wbits, name in ((-15, "raw Deflate"), (15, "zlib")):
+            try:
+                out = zlib.decompress(data, wbits)
+                if out: return peel(out, chain + [name], depth + 1)
+            except zlib.error:
+                pass
+    return chain, data, f"binary (entropy {_bytes_entropy(data[:65536]):.2f}{' - likely encrypted/compressed' if _bytes_entropy(data[:65536]) > 7.2 else ''})", None
+
+def _xor(data: bytes, kb: bytes) -> bytes:
+    if len(kb) == 1:
+        return data.translate(bytes(b ^ kb[0] for b in range(256)))
+    n = len(kb)
+    return bytes(b ^ kb[i % n] for i, b in enumerate(data))
+
+def _plausible(out: bytes) -> bool:
+    """Decoded result must look like real content, not just printable noise."""
+    if out[:2] in (b"MZ", b"\x1f\x8b"): return True
+    if _printable_ratio(out) < 0.95: return False
+    s = out.decode("latin-1")
+    return bool(PS_WORDS.search(s) or re.search(r"(?i)https?://|\\\\[\w.]+\\|\.(?:exe|dll|ps1)\b", s))
+
+_TEXT_SCORE = [0] * 256
+for _c in range(256):
+    if chr(_c) in " etaoinsrlhdcu$()-.=;'\"{}[]_ETAOINSRLHDC": _TEXT_SCORE[_c] = 3
+    elif 32 <= _c < 127 or _c in (9, 10, 13): _TEXT_SCORE[_c] = 1
+    else: _TEXT_SCORE[_c] = -8
+
+def _crack_repeating_xor(data: bytes, max_klen=64):
+    """Recover a repeating XOR key when the plaintext is text (classic key-length + per-column frequency attack)."""
+    sample = data[:16384]
+    if len(sample) < 512: return None
+    def ham(a, b): return sum(bin(x ^ y).count("1") for x, y in zip(a, b))
+    cands = []
+    for kl in range(1, max_klen + 1):
+        blocks = [sample[i*kl:(i+1)*kl] for i in range(min(24, len(sample) // kl))]
+        if len(blocks) < 4: continue
+        d = sum(ham(blocks[i], blocks[i+1]) for i in range(len(blocks) - 1)) / ((len(blocks) - 1) * kl)
+        cands.append((d, kl))
+    for _, kl in sorted(cands)[:6]:
+        key = bytearray()
+        for col in range(kl):
+            colbytes = sample[col::kl]
+            key.append(max(range(256), key=lambda k: sum(_TEXT_SCORE[b ^ k] for b in colbytes)))
+        for p in range(1, kl + 1):  # shrink to the shortest repeating period
+            if kl % p == 0 and key == (key[:p] * (kl // p)):
+                key = key[:p]; break
+        out = _xor(sample, bytes(key))
+        if _plausible(out):
+            return bytes(key)
+    return None
+
+def _xor_try(data: bytes, keys):
+    """Literal keys, then single-byte brute force, then repeating-key cryptanalysis. Returns (desc, plaintext) or None."""
+    sample = data[:4096]
+    for k in keys:
+        kb = k if isinstance(k, bytes) else str(k).encode()
+        if kb and _plausible(_xor(sample, kb)):
+            return f"XOR key {kb.decode('latin-1')!r} (literal in script)", _xor(data, kb)
+    for k in range(1, 256):
+        if _plausible(_xor(sample, bytes([k]))):
+            return f"XOR single byte 0x{k:02x}", _xor(data, bytes([k]))
+    if 4.5 < _bytes_entropy(data[:65536]) < 7.4:   # text XORed with a short key sits in this band
+        kb = _crack_repeating_xor(data)
+        if kb:
+            shown = kb.decode("latin-1") if all(32 <= c < 127 for c in kb) else kb.hex()
+            return f"XOR key {shown!r} (recovered by cryptanalysis)", _xor(data, kb)
+    return None
+
+def find_candidates(text: str):
+    """Yield (line, source_kind, raw_bytes_or_str) for encoded-looking literals."""
+    lines = text.splitlines()
+    for i, ln in enumerate(lines, 1):
+        # -EncodedCommand
+        for m in re.finditer(r"(?i)\s-e(?:n(?:c(?:o(?:d(?:e(?:d(?:c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?)?)?)?)?)?)?)?\s+['\"]?([A-Za-z0-9+/]{20,}={0,2})", ln):
+            b = _b64(m.group(1))
+            if b: yield i, "-EncodedCommand", b
+        # quoted base64
+        for m in re.finditer(r"['\"]([A-Za-z0-9+/]{20,}={0,2})['\"]", ln):
+            s = m.group(1)
+            if not (re.search(r"[A-Z]", s) and re.search(r"[a-z]", s) and re.search(r"\d", s)): continue
+            b = _b64(s)
+            if b: yield i, "Base64 string", b
+        # quoted hex
+        for m in re.finditer(r"['\"]((?:[0-9A-Fa-f]{2}){12,})['\"]", ln):
+            yield i, "hex string", bytes.fromhex(m.group(1))
+        # 0x byte lists
+        for m in re.finditer(r"(?:0x[0-9A-Fa-f]{1,2}\s*,\s*){7,}0x[0-9A-Fa-f]{1,2}", ln):
+            yield i, "0x byte array", bytes(int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]{1,2})", m.group(0)))
+        # decimal arrays (bytes or char codes)
+        for m in re.finditer(r"(?<![\d.\w])(?:\d{1,5}\s*,\s*){7,}\d{1,5}(?![\d.])", ln):
+            nums = [int(x) for x in m.group(0).split(",")]
+            if all(n < 256 for n in nums):
+                yield i, "decimal byte array", bytes(nums)
+            elif all(n < 0x110000 for n in nums):
+                yield i, "char-code array", "".join(chr(n) for n in nums).encode("utf-8", "replace")
+        # [char]N chains
+        for m in re.finditer(r"(?:\[char\]\s*\(?\s*\d{1,5}\s*\)?\s*\+?\s*){3,}", ln, re.I):
+            yield i, "[char] chain", "".join(chr(int(x)) for x in re.findall(r"\d+", m.group(0))).encode("utf-8", "replace")
+    # here-strings / long quoted blobs that may be Base85
+    for m in re.finditer(r"@[\"']\r?\n(.{200,}?)\r?\n[\"']@", text, re.S):
+        blob = m.group(1)
+        if _b64(blob): continue
+        line = text.count("\n", 0, m.start()) + 1
+        for name, alpha in B85_ALPHABETS:
+            b = _b85_custom(blob, alpha)
+            if b:
+                yield line, name, b; break
+
+def decode_all(text: str, max_items=200, _depth=0, _prefix="", _seen=None):
+    keys = []
+    for ln in text.splitlines():
+        if len(ln) > 200000 or not re.search(r"(?i)-bxor|-bor", ln): continue
+        keys += [int(k, 0) for k in re.findall(r"(?i)-bxor\s*(0x[0-9a-f]+|\d{1,3})\b", ln) if int(k, 0) < 256]
+        keys += re.findall(r"['\"]([^'\"\s]{4,64})['\"]", ln)
+    keys = [k if isinstance(k, str) else bytes([k]) for k in dict.fromkeys(keys)][:200]
+
+    arts = []
+    seen = _seen if _seen is not None else set()
+    for line, src, raw in find_candidates(text):
+        h = hashlib.sha256(raw).hexdigest()
+        if h in seen: continue
+        seen.add(h)
+        chain, final, kind, ftext = peel(raw, [src])
+        if ftext is None and kind.startswith("binary"):
+            x = _xor_try(final, keys)
+            if x:
+                chain2, final2, kind2, ftext2 = peel(x[1], chain + [x[0]])
+                chain, final, kind, ftext = chain2, final2, kind2, ftext2
+        interesting = (
+            (ftext is not None and len(ftext.strip()) >= 4 and len(chain) > 1 and
+             (len(chain) > 2 or PS_WORDS.search(ftext) or re.search(r"https?://|\\\\|\.exe|\.dll", ftext, re.I) or len(ftext) >= 24))
+            or kind.startswith(("PE", "Donut", "ELF", "ZIP"))
+            or len(final) >= 256
+        )
+        if not interesting: continue
+        loc = f"{_prefix}{line}"
+        arts.append({
+            "line": loc, "chain": chain, "kind": kind, "size": len(final),
+            "sha256": hashlib.sha256(final).hexdigest(), "text": ftext, "bytes": final,
+        })
+        # decoded text can hide further layers: scan it too
+        if ftext and len(ftext) > 64 and _depth < 3:
+            arts += decode_all(ftext, max_items - len(arts), _depth + 1, f"{loc}>", seen)
+        if len(arts) >= max_items: break
+    return arts
+
+def extract_iocs(texts):
+    iocs = {"urls": set(), "ips": set(), "paths": set()}
+    for t in texts:
+        if not t: continue
+        iocs["urls"].update(m.rstrip(".,;") for m in re.findall(r"(?i)\bhttps?://[^\s'\"<>()`]+", t))
+        for ip in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", t):
+            if all(int(o) < 256 for o in ip.split(".")) and not ip.startswith(("0.", "127.", "255.")):
+                iocs["ips"].add(ip)
+        iocs["paths"].update(re.findall(r"(?i)\b[A-Z]:\\(?:[^\\\s'\"<>|]+\\)*[^\\\s'\"<>|]+\.(?:exe|dll|ps1|bat|cmd|vbs|js|hta|lnk|tmp|dat)\b", t))
+        iocs["paths"].update(re.findall(r"(?i)\$env:(?:appdata|temp|localappdata|programdata|public|userprofile)[^\s'\";)]*", t))
+    return {k: sorted(v) for k, v in iocs.items()}
+
+def defang(s: str) -> str:
+    return s.replace("http", "hxxp").replace(".", "[.]")
+
+# --------------------------------------------------------------------------
+# Cleaner: resolve simple obfuscation inline -> readable copy (still NOT safe to run)
+# --------------------------------------------------------------------------
+_SQ = r"'(?:[^']|'')*'"
+_DQ = r'"[^"$`]*"'
+_LIT = f"(?:{_SQ}|{_DQ})"
+
+def _lit_val(s: str) -> str:
+    return s[1:-1].replace("''", "'") if s[0] == "'" else s[1:-1]
+
+def _q(s: str) -> str:
+    return "'" + s.replace("'", "''") + "'"
+
+CANON = ["Invoke-Expression", "New-Object", "Invoke-WebRequest", "Invoke-RestMethod", "Start-Process",
+         "Set-Variable", "Get-Variable", "Get-ChildItem", "Out-String", "Start-Sleep", "Add-Type",
+         "Invoke-Command", "Write-Host", "Net.WebClient", "DownloadString", "DownloadData", "DownloadFile",
+         "FromBase64String", "GetString", "IEX"]
+
+def clean_script(text: str):
+    counts = collections.Counter()
+    out_lines = []
+    for ln in text.splitlines():
+        if len(ln) > 200000:
+            out_lines.append(ln); continue
+        for _ in range(6):
+            before = ln
+            # 1. tick marks inside identifiers (keep real escapes `0 `a `b `e `f `n `r `t `u `v)
+            ln, n = re.subn(r"`(?=[A-Za-z])(?![0abefnrtuv])", "", ln); counts["backticks"] += n
+            # 2. ([char[]](n,n,..) -join '')  /  -join [char[]](..)
+            def cj(m):
+                nums = [int(x) for x in re.findall(r"\d+", m.group(1))]
+                return _q("".join(chr(x) for x in nums)) if all(x < 0x110000 for x in nums) else m.group(0)
+            ln, n = re.subn(r"\(\s*\[char\[\]\]\s*\(([\d\s,]+)\)\s*-join\s*(?:''|\"\")\s*\)", cj, ln, flags=re.I); counts["char arrays"] += n
+            ln, n = re.subn(r"-join\s*\(?\s*\[char\[\]\]\s*\(([\d\s,]+)\)\s*\)?", cj, ln, flags=re.I); counts["char arrays"] += n
+            # 3. [char]N + [char]N ...
+            def cc(m):
+                return _q("".join(chr(int(x)) for x in re.findall(r"\d+", m.group(0))))
+            ln, n = re.subn(r"\[char\]\s*\(?\s*\d{1,5}\s*\)?(?:\s*\+\s*\[char\]\s*\(?\s*\d{1,5}\s*\)?)*", cc, ln, flags=re.I); counts["[char] casts"] += n
+            # 4. "{1}{0}" -f 'a','b'
+            def ff(m):
+                fmt = _lit_val(m.group("fmt"))
+                args = [_lit_val(a) for a in re.findall(_LIT, m.group("args"))]
+                try: res = re.sub(r"\{(\d+)\}", lambda k: args[int(k.group(1))], fmt)
+                except IndexError: return m.group(0)
+                return _q(res)
+            ln, n = re.subn(rf"\(?\s*(?P<fmt>{_LIT})\s*-f\s*(?P<args>{_LIT}(?:\s*,\s*{_LIT})*)\s*\)?", ff, ln, flags=re.I); counts["-f format strings"] += n
+            # 5. 'a'+'b'+'c'
+            def cat(m):
+                return _q("".join(_lit_val(x) for x in re.findall(_LIT, m.group(0))))
+            ln, n = re.subn(rf"{_LIT}(?:\s*\+\s*{_LIT})+", cat, ln); counts["string concatenations"] += n
+            if ln == before: break
+        # 6. canonical casing for well-known names
+        for w in CANON:
+            ln, n = re.subn(rf"(?i)(?<![\w-]){re.escape(w)}(?![\w-])", lambda m, w=w: w, ln)
+            # count only real case changes
+        out_lines.append(ln)
+    cleaned = "\n".join(out_lines)
+    case_fixed = sum(1 for a, b in zip(text.split(), cleaned.split()) if a != b and a.lower() == b.lower())
+    if case_fixed: counts["case normalised"] = case_fixed
+    return cleaned, {k: v for k, v in counts.items() if v}
+
+def build_clean_file(path, text, arts, iocs):
+    cleaned, counts = clean_script(text)
+    hdr = [
+        "<#  psfingerprint cleaned copy - STATIC TRANSFORM, NOT VERIFIED.",
+        "    THIS IS STILL MALWARE. DO NOT RUN. Kept as .txt on purpose.",
+        f"    source: {os.path.basename(path)}",
+        "    resolved: " + (", ".join(f"{k} x{v}" for k, v in counts.items()) or "nothing"),
+        "#>", "",
+    ]
+    ftr = ["", "", "<# ===== DECODED ARTEFACTS (static) ====="]
+    for n, a in enumerate(arts, 1):
+        ftr.append(f"[{n}] line {a['line']}: {' -> '.join(a['chain'])} => {a['kind']} ({a['size']:,} bytes, sha256 {a['sha256']})")
+        if a["text"]:
+            ftr.append("    " + a["text"][:2000].replace("#>", "# >").replace("\n", "\n    "))
+    if any(iocs.values()):
+        ftr.append("\n===== IOCs FROM DECODED CONTENT (defanged) =====")
+        for k, vals in iocs.items():
+            for v in vals: ftr.append(f"{k[:-1]:<5} {defang(v)}")
+    ftr.append("#>")
+    return "\n".join(hdr) + cleaned + "\n".join(ftr) + "\n", counts
+
+def save_artefacts(outdir, arts):
+    os.makedirs(outdir, exist_ok=True)
+    saved = []
+    for n, a in enumerate(arts, 1):
+        ext = "txt" if a["text"] is not None else "bin"
+        slug = re.sub(r"[^a-z0-9]+", "-", a["kind"].lower()).strip("-")[:30]
+        loc = re.sub(r"[^0-9]+", "-in-", str(a["line"]))
+        fn = os.path.join(outdir, f"artefact_{n:02d}_L{loc}_{slug}.{ext}")
+        with open(fn, "wb") as f:
+            f.write(a["text"].encode("utf-8") if a["text"] is not None else a["bytes"])
+        saved.append(fn)
+    return saved
+
+# --------------------------------------------------------------------------
 # Presentation
 # --------------------------------------------------------------------------
-VERSION = "1.1"
+VERSION = "1.2"
 
 CATEGORIES = [
     ("Obfuscation (hides the code's text)", [
@@ -278,7 +633,21 @@ HOW TO READ THE REPORT
    Leads worth following: decoded command names, likely XOR keys, where the
    payload blob is and what it looks like (GZip / PE / Donut / UTF-16).
 
-5. EXECUTION SINKS TO DEFANG
+5. DECODED CONTENT
+   Encoded literals the tool found and decoded WITHOUT running anything.
+     [n] L<line>  chain  =>  result
+   The chain shows each step, e.g.
+     decimal byte array -> text -> Base64 -> XOR key 'K' (recovered) -> text
+   L59275>326 means "line 326 inside the text decoded from line 59275".
+   Supported: Base64, -EncodedCommand (UTF-16LE), hex, 0x arrays, decimal
+   arrays, [char] chains, Base85 (3 alphabets), GZip, raw Deflate, zlib, XOR
+   (literal keys, single-byte brute force, repeating-key cryptanalysis).
+   Red results (PE / Donut / ELF / ZIP) are final binaries - save them with
+   --outdir and analyse them with the right tool.
+   IoCs (URLs, IPs, file paths) found in decoded text are listed, defanged.
+   If the verdict shows 'Final stage', you may not need to run anything.
+
+6. EXECUTION SINKS TO DEFANG
    Every place the script can RUN code. Before you execute the sample anywhere,
    replace each of these with a write-to-file, e.g.
        [IO.File]::WriteAllText("layer2.txt", $payload)
@@ -287,7 +656,8 @@ HOW TO READ THE REPORT
    they resolve to; they can hide a second iex or a runspace.
 
 WORKFLOW
-   fingerprint -> defang sinks -> run copy offline -> fingerprint layer 2 -> ...
+   fingerprint (+ static decode) -> if it reached the final stage, stop here
+   otherwise: defang sinks -> run copy offline -> fingerprint layer 2 -> ...
    until the output reads like normal code (behaviour traits appear, junk stops).
 """
 
@@ -355,7 +725,18 @@ def report(path, res, sinks_only=False, explain=True):
         match = f"{top['profile']}  [score {top['score']}]"
     else:
         conf, cc, match = "-", C.dim, "no known profile matched"
-    if beh and lvl != "HEAVY":
+    arts = res.get("decoded", [])
+    dbeh = [k for k in res.get("decoded_behaviour", []) if k not in beh]
+    final_bin = [a for a in arts if a["kind"].startswith(("PE", "Donut", "ELF", "ZIP"))]
+    if final_bin:
+        fb = final_bin[-1]
+        tool = ("donut-decryptor" if fb["kind"].startswith("Donut") else
+                "DIE / capa / dnSpyEx" if fb["kind"].startswith("PE") else "a sandbox")
+        nxt = (f"decoded statically down to a {fb['kind'].split(' (')[0]} (L{fb['line']}). "
+               f"Save it with --outdir and analyse it with {tool} - no need to run the script")
+    elif any(a["text"] and len(a["text"]) > 200 for a in arts):
+        nxt = "next layer decoded statically - re-run with --outdir and fingerprint the saved .txt"
+    elif beh and lvl != "HEAVY":
         nxt = ("readable layer showing malicious behaviour - DO NOT run it. Analyse it statically"
                + (" and carve/decode the payload blob (see Hints)" if st["longest_line"] > 100000 else ""))
     elif sink_lines:
@@ -370,6 +751,10 @@ def report(path, res, sinks_only=False, explain=True):
     p(f"    Best match  : {match}")
     p(f"    Confidence  : {cc(conf)}")
     p(f"    Behaviour   : {C.red(', '.join(beh)) if beh else C.dim('none detected at this layer (expected while still encoded)')}")
+    if dbeh:
+        p(f"    In decoded  : {C.red(', '.join(dbeh))}")
+    if final_bin:
+        p(f"    Final stage : {C.red(final_bin[-1]['kind'])}  sha256 {final_bin[-1]['sha256']}")
     p(f"    Next step   : {nxt}")
 
     if not sinks_only:
@@ -400,6 +785,32 @@ def report(path, res, sinks_only=False, explain=True):
             section(p, "Hints", "Leads to follow up: decoded names, keys, and where the payload blob is.", explain)
             for h in dict.fromkeys(res["hints"]):
                 p(f"  * {h}")
+
+        if "decoded" in res:
+            arts = res["decoded"]
+            section(p, f"Decoded content ({len(arts)} artefact(s))",
+                    "Encoded literals found and decoded statically. Chain = how each was peeled. "
+                    "Repeating XOR keys are recovered by cryptanalysis when the plaintext is text; anything else computed at runtime needs the defang workflow.", explain)
+            if not arts:
+                p("  nothing decodable found at this layer")
+            for n, a in enumerate(arts[:25], 1):
+                kc = C.red if a["kind"].startswith(("PE", "Donut", "ELF", "ZIP")) else (C.grn if a["text"] else C.yel)
+                p(f"  [{n}] L{a['line']}  {' -> '.join(a['chain'])}  =>  {kc(a['kind'])}  ({a['size']:,} B)")
+                if a["text"]:
+                    prev = re.sub(r"\s+", " ", a["text"].strip())[:200]
+                    p(C.dim(f"       {prev}{' ...' if len(a['text']) > 200 else ''}"))
+                else:
+                    p(C.dim(f"       sha256 {a['sha256']}  first bytes {a['bytes'][:16].hex(' ')}"))
+            if len(arts) > 25:
+                p(C.dim(f"  ... {len(arts) - 25} more - use --outdir to save them all"))
+            iocs = res.get("iocs", {})
+            if any(iocs.values()):
+                p("  " + C.red("IoCs in decoded content (defanged):"))
+                for k, vals in iocs.items():
+                    for v in vals[:30]:
+                        p(f"    {k[:-1]:<5} {defang(v)}")
+            for line in res.get("saved", []):
+                p(C.dim(f"  saved: {line}"))
 
     section(p, f"Execution sinks to defang ({len(sinks)} on {len(sink_lines)} line(s))",
             "Places the script can RUN code. Replace each with a write-to-file before executing a copy. "
@@ -437,6 +848,9 @@ It READS the file as text and never executes it. For each file it tells you:
               Chimera, xencrypt, encoded launchers, commodity loader kits...)
   * TECHNIQUES every trick found, grouped by purpose, with line numbers
   * HINTS     decoded command names, XOR keys, payload blob type
+  * DECODED   Base64 / -enc / hex / decimal / [char] / Base85 blobs, peeled
+              through UTF-16, GZip, Deflate and XOR (keys recovered where
+              possible), with URLs, IPs and paths extracted
   * SINKS     every line that can execute code - defang these first
 """
 
@@ -450,6 +864,11 @@ examples:
         just the lines you must defang before running a copy
   python -I psfingerprint.py sample.txt --json > report.json
         machine-readable output for pipelines / ticket enrichment
+  python -I psfingerprint.py sample.txt --outdir out
+        save every decoded artefact (.txt text / .bin binary) to out/
+  python -I psfingerprint.py sample.txt --clean
+        write sample.clean.txt - backticks, concat, -f and [char] resolved,
+        decoded artefacts and IoCs appended (still NOT safe to run)
   python -I psfingerprint.py --guide
         explains every section of the report and the scoring
   python -I psfingerprint.py --list techniques
@@ -479,6 +898,14 @@ def main():
                    help="hide the one-line explanations under each section")
     g.add_argument("--no-color", action="store_true",
                    help="disable coloured output (auto-off when piped)")
+    d = ap.add_argument_group("decoding")
+    d.add_argument("--no-decode", action="store_true",
+                   help="skip the static decoder (faster on huge files)")
+    d.add_argument("--outdir", metavar="DIR",
+                   help="save every decoded artefact to DIR (.txt for text, .bin for binary)")
+    d.add_argument("--clean", action="store_true",
+                   help="also write <file>.clean.txt: a readable copy with backticks, concat, -f and [char] "
+                        "resolved inline, plus decoded artefacts and IoCs appended (still NOT safe to run)")
     r = ap.add_argument_group("reference")
     r.add_argument("--guide", action="store_true",
                    help="explain how to read the report, then exit")
@@ -489,7 +916,7 @@ def main():
 
     if not a.no_color and not a.json and sys.stdout.isatty():
         if sys.platform == "win32":
-            import os; os.system("")  # enables ANSI escape handling in Windows consoles
+            os.system("")  # enables ANSI escape handling in Windows consoles
         C.on = True
 
     if a.guide:
@@ -508,10 +935,36 @@ def main():
         text = raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") \
             else raw.decode("utf-8", errors="replace").lstrip("﻿")
         res = scan(text)
+        if not a.no_decode:
+            arts = decode_all(text)
+            res["decoded"] = arts
+            res["iocs"] = extract_iocs([x["text"] for x in arts])
+            dtech = set()
+            for x in arts:
+                if x["text"] and len(x["text"]) > 64:
+                    dtech |= {k for k in scan(x["text"])["techniques"] if k in BEHAVIOUR}
+            res["decoded_behaviour"] = sorted(dtech)
+            saved = []
+            if a.outdir:
+                sub = os.path.join(a.outdir, re.sub(r"[^\w.-]", "_", os.path.basename(f)))
+                saved += save_artefacts(sub, arts)
+            if a.clean:
+                body, _ = build_clean_file(f, text, arts, res["iocs"])
+                base = os.path.splitext(f)[0] if f.lower().endswith(".txt") else f
+                target = (os.path.join(a.outdir, os.path.basename(base) + ".clean.txt")
+                          if a.outdir else base + ".clean.txt")
+                if a.outdir: os.makedirs(a.outdir, exist_ok=True)
+                with open(target, "w", encoding="utf-8") as fh: fh.write(body)
+                saved.append(target)
+            res["saved"] = saved
         allres[f] = res
         if not a.json:
             print(report(f, res, a.sinks_only, explain=not a.quiet)); print()
     if a.json:
+        for r_ in allres.values():
+            for x in r_.get("decoded", []):
+                x.pop("bytes", None)
+                if x["text"] and len(x["text"]) > 5000: x["text"] = x["text"][:5000] + " ...[truncated]"
         print(json.dumps(allres, indent=2))
 
 if __name__ == "__main__":

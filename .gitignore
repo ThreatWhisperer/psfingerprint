@@ -226,3 +226,7 @@ samples/
 *.ps1.txt
 *.bin
 report*.json
+
+out/
+*.clean.txt
+carved/
